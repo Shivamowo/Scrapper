@@ -1,0 +1,214 @@
+AmbitionBox Scraper — Technical Explanation
+============================================
+File: explanation.txt
+Script: scraper.py
+Output: companies.csv
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. TOOLS & LIBRARIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Library             Version     Purpose
+─────────────────── ─────────── ─────────────────────────────────────────────
+requests            2.32.3      Primary HTTP client; fast, session-aware
+beautifulsoup4      4.14.3      HTML parsing; parses each page exactly once
+lxml                6.1.0       High-speed parser backend for BeautifulSoup
+pandas              2.2.3       Final DataFrame assembly, CSV normalisation
+selenium            4.44.0      Headless Chrome fallback (JS-rendered content)
+webdriver-manager   4.0.2       Auto-downloads matching ChromeDriver binary
+
+Standard library modules used:
+  threading.Lock     — serialises concurrent CSV writes
+  concurrent.futures — ThreadPoolExecutor + as_completed
+  itertools.cycle    — User-Agent rotation without index tracking
+  csv.DictWriter     — incremental row-level CSV append
+  re                 — regex for score extraction and key normalisation
+  time, random       — polite 1–2.5 s crawl delay
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. LISTING → PROFILE NAVIGATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHASE 1 — Listing pages (generator, 5 pages):
+  URL pattern:
+    https://www.ambitionbox.com/list-of-companies?campaign=desktop_nav&page=1
+    …
+    https://www.ambitionbox.com/list-of-companies?campaign=desktop_nav&page=5
+
+  iter_companies_from_listing() is a Python generator function.
+  It yields (company_name, profile_url) tuples ONE AT A TIME as it paginates.
+  The caller (main) accumulates up to MAX_COMPANIES=50 tuples — no more are
+  ever fetched. Memory usage is O(1) with respect to total company count.
+
+  Real selectors (verified by DOM inspection):
+    Primary card container → div.companyCardWrapper__primaryInformation
+    Company name           → .companyCardWrapper__header  (first text node)
+    Profile link           → first <a href="/..."> inside or parent of card
+
+  Fallback cascade (handles site restructuring):
+    1. div[class*='companyCardWrapper']
+    2. div[class*='company-card']
+    3. article[class*='company']
+    4. All <a href> links containing "/overview" (last resort)
+
+PHASE 2 — Profile pages (per company):
+  Each profile URL ends in /overview, e.g.:
+    https://www.ambitionbox.com/overview/google-overview
+
+  scrape_company_profile() fetches that URL and extracts all fields
+  from a SINGLE parsed BeautifulSoup object. There is no second parse.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. FIELD EXTRACTION — REAL SELECTORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Field             Selector / Strategy
+─────────────── ─────────────────────────────────────────────────────────────
+company_name    <h1> text (canonical name from profile page)
+overall_rating  <h6> containing "Overall Rating" → sibling element whose
+                text matches r"^\d+(\.\d+)?$"
+total_reviews   String search: regex r"\d[\d,]*\s+review" anywhere in page
+industry        div with classes "flex flex-row items-stretch gap-2" →
+                first non-trivial text inside (span / a / p)
+description     Element with id or class containing "about" or "description"
+key ratings     String "Key Factors to Consider" → parent container →
+                descendant elements with class *ratingcard* / *keyrating* /
+                *ratingItem* → text split into label|score pairs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DYNAMIC RATING COLUMNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+No rating category names are hardcoded anywhere.
+
+Extraction process:
+  1. Locate the "Key Factors to Consider" heading via regex string search.
+  2. Walk up parent elements until we find a container that holds rating items.
+  3. For each item, split text on "|" separator to isolate label vs. score.
+     Label: non-numeric string > 2 chars
+     Score: matches r"^\d+(\.\d+)?$"
+  4. Normalise the label to a CSV-safe key:
+       "Work-Life Balance" → "rating_work_life_balance"
+       "Salary & Benefits" → "rating_salary___benefits"
+       regex: re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+Because different company pages may expose different categories
+(e.g., startups may lack "Job Security"), pandas is used in the final
+normalise_and_save() step to union all column names and fill any missing
+cell with "N/A" — ensuring every row has exactly the same columns.
+
+Column ordering in the final CSV:
+  [fixed cols] company_name, profile_url, overall_rating,
+               total_reviews, industry, description
+  [rating cols] rating_* sorted alphabetically
+  [any others]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CONCURRENCY IMPLEMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Threading model:
+  Main thread  → runs iter_companies_from_listing() sequentially
+               → submits up to 50 futures to ThreadPoolExecutor
+  Worker pool  → MAX_WORKERS=8 threads scrape profile pages in parallel
+  CSV thread   → writes are serialised via a shared threading.Lock
+
+Why threads and not asyncio?
+  requests is a synchronous library. Wrapping it in asyncio would require
+  either aiohttp (rewrite) or run_in_executor (same threads, more complexity).
+  8 I/O-bound threads deliver near-linear speedup for 50 profiles; the sweet
+  spot for this task without overloading the server.
+
+Per-thread sessions:
+  Each _worker() call creates its own requests.Session via make_session().
+  This avoids header-mutation race conditions: if two threads simultaneously
+  wrote a User-Agent to a shared session, one would overwrite the other.
+
+as_completed():
+  futures are consumed as they FINISH, not in submission order.
+  This means CSV rows are written in the order profiles are scraped —
+  faster companies are not blocked waiting for slower ones.
+
+threading.Lock usage:
+  save_row_to_csv(row, filepath, lock) acquires the lock, opens the file in
+  append mode, writes one row, and releases the lock. The critical section is
+  ~microseconds wide; contention is negligible.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. EDGE CASE HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Edge case                   How it's handled
+──────────────────────────  ────────────────────────────────────────────────
+Blocked / CAPTCHA response  HTML < 2000 chars → automatic Selenium fallback
+Selenium not installed      SELENIUM_AVAILABLE flag → log error, return None
+Any field missing           try/except per field → default "N/A"
+Listing page fails to load  Log error, skip page, continue with next
+Profile page fails to load  Return dict of all "N/A" values, still written
+Dynamic rating parse error  Inner try/except per item → skip that item only
+Duplicate CSV header        _csv_headers_written flag → written exactly once
+Misaligned rating columns   pandas fillna("N/A") in normalise_and_save()
+Stale companies.csv         Deleted at startup (os.remove) for a clean run
+>50 companies yielded       Generator stops after MAX_COMPANIES=50 tuples
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. LIMITATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+a) JavaScript-rendered content
+   AmbitionBox is a React app. The requests+BS4 path works when the server
+   returns pre-rendered HTML (SSR). If content is injected purely client-side,
+   Selenium is required. Selenium adds ~3–5 s per page vs ~0.5 s for requests.
+
+b) Anti-bot / rate limiting
+   Rotating User-Agents and 1–2.5 s delays reduce risk but won't defeat
+   advanced bot detection (fingerprinting, TLS inspection). For production
+   scale, use a rotating proxy service (Bright Data, Oxylabs, ScraperAPI).
+
+c) Selector fragility
+   CSS class names (companyCardWrapper__*, flex flex-row items-stretch gap-2)
+   are implementation details that can change with any frontend deploy.
+   The multi-selector fallback cascade mitigates this but cannot fully prevent
+   breakage after a major redesign.
+
+d) ChromeDriver dependency
+   The Selenium fallback requires Google Chrome installed locally.
+   webdriver-manager downloads the matching ChromeDriver automatically, but
+   this needs an internet connection and fails if Chrome is not present.
+
+e) CSV column drift on incremental write
+   Because we write rows incrementally (before all 50 are done), the
+   initial header reflects only the first row's keys. The final
+   normalise_and_save() call rewrites the file with all columns unified.
+   Interrupting the script mid-run leaves a partial CSV with missing columns
+   — re-run the script from scratch in that case.
+
+f) Point-in-time data
+   All scraped values (ratings, review counts) are live at scrape time.
+   They are not historical records and will diverge from the site over time.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO RUN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # 1. Install dependencies
+  pip install -r requirements.txt
+
+  # 2. Run the scraper
+  python scraper.py
+
+  # 3. Output
+  companies.csv  — written incrementally; finalised at the end.
+
+Tuning tips:
+  MAX_WORKERS = 8    → increase cautiously; higher values = more risk of blocks
+  DELAY_MIN/MAX      → increase for safer crawling on slow connections
+  TOTAL_PAGES        → increase beyond 5 to scrape more than 50 companies
